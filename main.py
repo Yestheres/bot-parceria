@@ -8,7 +8,6 @@ from discord.ext import commands, tasks
 
 from config import BOT_NAME, DISCORD_TOKEN, WIZARD_TIMEOUT_SECONDS
 from database import Database
-from wizard.manager import ticket_channel
 from wizard.steps import Step
 
 logger = logging.getLogger("parceria")
@@ -62,32 +61,37 @@ class ParceriaBot(commands.Bot):
         if message.author.bot or not message.guild:
             return
 
-        # Só processa se for resposta de um wizard aberto
+        # Se for canal de ticket aberto
         ticket = await self.database.get_ticket_by_channel(message.channel.id)
         if ticket and ticket["status"] == "open":
-            step = Step(ticket["step"])
-            # Só processa texto nos passos que esperam resposta
-            if step not in {Step.CONFIRMAR, Step.DONE}:
-                # Se for staff, ignora (staff não responde o wizard)
-                if not (
-                    isinstance(message.author, discord.Member)
-                    and (
-                        message.author.guild_permissions.administrator
-                        or message.author.guild_permissions.manage_guild
+            # Só o dono do ticket interage com o wizard
+            if message.author.id != ticket["user_id"]:
+                return
+
+            # Passos finais não processam texto (só botões)
+            if ticket["step"] in (Step.CONFIRMAR.value, Step.DONE.value):
+                return
+
+            logger.info(
+                "Wizard msg: user=%s step=%s content=%r",
+                message.author.id, ticket["step"], message.content[:80],
+            )
+            from wizard.manager import WizardManager
+
+            wizard = WizardManager(self, self.database)
+            try:
+                await wizard.process_answer(message, ticket)
+            except Exception:
+                logger.exception("Erro no wizard")
+                try:
+                    await message.channel.send(
+                        "❌ Tive um erro processando sua resposta. Chama a staff."
                     )
-                    and message.author.id != ticket["user_id"]
-                ):
-                    # Só o autor do ticket responde
-                    if message.author.id == ticket["user_id"]:
-                        from wizard.manager import WizardManager
+                except discord.HTTPException:
+                    pass
+            return
 
-                        wizard = WizardManager(self, self.database)
-                        try:
-                            await wizard.process_answer(message, ticket)
-                        except Exception:
-                            logger.exception("Erro no wizard")
-                    return
-
+        # Mensagem normal: processa comandos com prefixo (se houver)
         await self.process_commands(message)
 
     @tasks.loop(minutes=5)
