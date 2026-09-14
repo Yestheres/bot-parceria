@@ -25,14 +25,10 @@ _MENTION_RE = re.compile(r"^<@!?\d+>\s*")
 
 
 def strip_leading_mention(content: str) -> str:
-    """Remove menções ao bot no começo da mensagem (que vem de reply)."""
     return _MENTION_RE.sub("", content or "").strip()
 
 
 def _coerce_data(raw: Any) -> dict[str, Any]:
-    """Garante que o campo `data` venha como dict, mesmo se o driver
-    devolver string JSON (o que acontece com tickets antigos gravados
-    antes do codec JSONB ser configurado no pool)."""
     if raw is None:
         return {}
     if isinstance(raw, dict):
@@ -207,7 +203,59 @@ class WizardManager:
     ) -> None:
         await self.db.update_ticket_step(ticket["id"], next_step.value, data)
         channel = ticket_channel(ticket, self.bot)
-        await self.send_question(channel, next_step)
+
+        # Se chegou na confirmação, manda preview + botões de staff
+        if next_step == Step.CONFIRMAR:
+            await self._send_confirmation(channel, ticket, data)
+        else:
+            await self.send_question(channel, next_step)
+
+    async def _send_confirmation(
+        self,
+        channel: discord.TextChannel,
+        ticket: dict[str, Any],
+        data: dict[str, Any],
+    ) -> None:
+        """Manda preview da embed + botões de aprovar/recusar."""
+        from ui.staff_review import StaffReviewView
+
+        color_name = data.get("color", DEFAULT_COLOR)
+        color_int = EMBED_COLORS.get(color_name, EMBED_COLORS[DEFAULT_COLOR])
+
+        embed = discord.Embed(
+            title=data.get("invite_name") or data.get("name") or "Parceria",
+            description=data.get("description") or "*sem descrição*",
+            color=discord.Color(color_int),
+        )
+        icon = data.get("invite_icon")
+        if icon:
+            embed.set_thumbnail(url=icon)
+        img = data.get("image_url")
+        if img:
+            embed.set_image(url=img)
+
+        embed.set_footer(text="Preview — aguardando decisão da staff")
+
+        view = StaffReviewView(self.bot, ticket["id"])
+
+        link = data.get("link")
+        if link:
+            if not link.startswith(("http://", "https://")):
+                link = "https://" + link
+            view.add_item(
+                discord.ui.Button(
+                    label="Entrar no servidor",
+                    style=discord.ButtonStyle.link,
+                    url=link,
+                )
+            )
+
+        await channel.send(
+            "✅ **Wizard concluído!**\n"
+            "Staff, deem uma olhada no preview e decidam:",
+            embed=embed,
+            view=view,
+        )
 
 
 def ticket_channel(ticket: dict[str, Any], bot: discord.Client) -> discord.TextChannel:
