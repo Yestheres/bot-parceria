@@ -5,13 +5,13 @@ from typing import Any
 
 import discord
 
-from config import EMBED_COLORS, DEFAULT_COLOR
+from config import DEFAULT_COLOR, EMBED_COLORS
 
 logger = logging.getLogger(__name__)
 
 
 class StaffReviewView(discord.ui.View):
-    """Botões que a staff usa pra aprovar/recusar no canal do ticket."""
+    """Botões que a staff usa pra aprovar/recusar/fechar no canal do ticket."""
 
     def __init__(self, bot: discord.Client, ticket_id: int) -> None:
         super().__init__(timeout=None)
@@ -25,7 +25,6 @@ class StaffReviewView(discord.ui.View):
             )
             return False
 
-        # Só staff (Manage Guild) pode usar
         perms = interaction.user.guild_permissions
         if not (perms.administrator or perms.manage_guild):
             await interaction.response.send_message(
@@ -54,7 +53,6 @@ class StaffReviewView(discord.ui.View):
             await interaction.followup.send("Esse ticket já foi fechado.", ephemeral=True)
             return
 
-        # Pede pro staff escolher o canal de publicação
         await interaction.followup.send(
             "Escolha o **canal onde a parceria vai ser publicada**:",
             view=PublicationChannelView(self.bot, self.ticket_id),
@@ -82,13 +80,84 @@ class StaffReviewView(discord.ui.View):
 
         await db.close_ticket(self.ticket_id, status="rejected")
         await interaction.channel.send(
-            f"❌ Parceria recusada por {interaction.user.mention}."
+            f"❌ Parceria recusada por {interaction.user.mention}.\n"
+            f"_Staff, use **🔒 Fechar ticket** pra arquivar esse canal._"
         )
 
-        # Desabilita botões
+        # Desabilita os botões de aprovar/recusar
         for child in self.children:
-            child.disabled = True  # type: ignore[attr-defined]
-        await interaction.message.edit(view=self) if interaction.message else None
+            if isinstance(child, discord.ui.Button) and not child.custom_id.startswith("staff:close"):
+                child.disabled = True
+        if interaction.message:
+            try:
+                await interaction.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(
+        label="Fechar ticket",
+        style=discord.ButtonStyle.secondary,
+        emoji="🔒",
+        custom_id="staff:close",
+    )
+    async def close(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
+            return
+
+        db = self.bot.database  # type: ignore[attr-defined]
+        ticket = await db.get_ticket_by_channel(interaction.channel_id)
+        if not ticket or ticket["status"] != "open":
+            await interaction.followup.send("Esse ticket já foi fechado.", ephemeral=True)
+            return
+
+        # Fecha no banco
+        await db.close_ticket(self.ticket_id, status="closed")
+
+        # Avisa no canal antes de mover
+        try:
+            await interaction.channel.send(
+                f"🔒 Ticket fechado por {interaction.user.mention}. "
+                "Movendo pra arquivo..."
+            )
+        except discord.HTTPException:
+            pass
+
+        # Move pra categoria de fechados (se configurada) e renomeia
+        closed_category_id = await db.get_closed_category(interaction.guild.id)
+        new_category = None
+        if closed_category_id:
+            cat = interaction.guild.get_channel(closed_category_id)
+            if isinstance(cat, discord.CategoryChannel):
+                new_category = cat
+
+        # Renomeia
+        old_name = interaction.channel.name
+        new_name = f"fechado-{old_name}"[:100]
+
+        try:
+            await interaction.channel.edit(
+                name=new_name,
+                category=new_category,
+                reason=f"Ticket fechado por {interaction.user}",
+            )
+        except discord.HTTPException:
+            logger.exception("Falha ao mover/renomear canal")
+            await interaction.followup.send(
+                "Não consegui mover o canal pra categoria de fechados. "
+                "Verifique minhas permissões.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            "✅ Ticket fechado e movido pra arquivo.", ephemeral=True
+        )
 
 
 class PublicationChannelView(discord.ui.View):
@@ -125,7 +194,6 @@ class PublicationChannelView(discord.ui.View):
             await interaction.followup.send("Canal inválido.", ephemeral=True)
             return
 
-        # Valida permissões do bot no canal escolhido
         me = interaction.guild.me if interaction.guild else None
         if me:
             perms = channel.permissions_for(me)
@@ -138,6 +206,13 @@ class PublicationChannelView(discord.ui.View):
                 return
 
         data: dict[str, Any] = dict(ticket["data"] or {})
+        if isinstance(data, str):
+            import json as _json
+            try:
+                data = _json.loads(data)
+            except Exception:
+                data = {}
+
         color_name = data.get("color", DEFAULT_COLOR)
         color_int = EMBED_COLORS.get(color_name, EMBED_COLORS[DEFAULT_COLOR])
 
@@ -176,13 +251,19 @@ class PublicationChannelView(discord.ui.View):
             )
             return
 
-        # Salva como canal padrão
         await db.set_publication_channel(interaction.guild_id, channel.id)
         await db.close_ticket(self.ticket_id, status="approved")
 
         await interaction.followup.send(
             f"✅ Parceria publicada em {channel.mention}!", ephemeral=True
         )
-        await interaction.channel.send(
-            f"✅ Parceria aprovada e publicada por {interaction.user.mention}."
-        )
+
+        # Avisa no ticket pra staff fechar
+        try:
+            await interaction.channel.send(
+                f"✅ Parceria aprovada e publicada em {channel.mention} "
+                f"por {interaction.user.mention}.\n"
+                f"_Staff, use **🔒 Fechar ticket** pra arquivar esse canal._"
+            )
+        except discord.HTTPException:
+            pass
