@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import date
 from typing import Any
 
 import asyncpg
@@ -19,7 +20,6 @@ class Database:
 
     async def connect(self) -> None:
         async def _init_connection(conn: asyncpg.Connection) -> None:
-            # Faz asyncpg converter JSONB <-> dict Python automaticamente.
             await conn.set_type_codec(
                 "jsonb",
                 encoder=json.dumps,
@@ -77,9 +77,19 @@ class Database:
                 ai_api_key            TEXT,
                 ai_model              TEXT,
                 ai_base_url           TEXT,
+                birthday_channel_id   BIGINT,
+                birthday_role_id      BIGINT,
                 updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+
+        # Garante colunas em bancos que já existiam (migration idempotente)
+        await conn.execute(
+            "ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS birthday_channel_id BIGINT"
+        )
+        await conn.execute(
+            "ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS birthday_role_id BIGINT"
+        )
 
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS tickets (
@@ -104,6 +114,33 @@ class Database:
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_tickets_step_updated
             ON tickets (step, updated_at)
+        """)
+
+        # ---------- Aniversários ----------
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS birthdays (
+                guild_id    BIGINT NOT NULL,
+                user_id     BIGINT NOT NULL,
+                day         INT NOT NULL,
+                month       INT NOT NULL,
+                created_by  BIGINT,
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (guild_id, user_id)
+            )
+        """)
+
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_birthdays_day_month
+            ON birthdays (guild_id, month, day)
+        """)
+
+        # Controle de execução diária (pra evitar duplicar e fazer catch-up)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS birthday_runs (
+                guild_id                 BIGINT PRIMARY KEY,
+                last_congrats_date       DATE,
+                last_role_cleanup_date   DATE
+            )
         """)
 
     # ---------- guild_config ----------
@@ -245,6 +282,152 @@ class Database:
             guild_id,
         )
 
+    # ---------- Aniversário: config ----------
+    async def set_birthday_channel(self, guild_id: int, channel_id: int) -> None:
+        await self.pool.execute(
+            """
+            INSERT INTO guild_config (guild_id, birthday_channel_id)
+            VALUES ($1, $2)
+            ON CONFLICT (guild_id) DO UPDATE
+                SET birthday_channel_id = EXCLUDED.birthday_channel_id,
+                    updated_at = NOW()
+            """,
+            guild_id, channel_id,
+        )
+
+    async def get_birthday_channel(self, guild_id: int) -> int | None:
+        row = await self.pool.fetchrow(
+            "SELECT birthday_channel_id FROM guild_config WHERE guild_id = $1",
+            guild_id,
+        )
+        return row["birthday_channel_id"] if row else None
+
+    async def set_birthday_role(self, guild_id: int, role_id: int) -> None:
+        await self.pool.execute(
+            """
+            INSERT INTO guild_config (guild_id, birthday_role_id)
+            VALUES ($1, $2)
+            ON CONFLICT (guild_id) DO UPDATE
+                SET birthday_role_id = EXCLUDED.birthday_role_id,
+                    updated_at = NOW()
+            """,
+            guild_id, role_id,
+        )
+
+    async def get_birthday_role(self, guild_id: int) -> int | None:
+        row = await self.pool.fetchrow(
+            "SELECT birthday_role_id FROM guild_config WHERE guild_id = $1",
+            guild_id,
+        )
+        return row["birthday_role_id"] if row else None
+
+    # ---------- Aniversário: CRUD ----------
+    async def upsert_birthday(
+        self,
+        guild_id: int,
+        user_id: int,
+        day: int,
+        month: int,
+        created_by: int | None,
+    ) -> None:
+        await self.pool.execute(
+            """
+            INSERT INTO birthdays (guild_id, user_id, day, month, created_by)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (guild_id, user_id) DO UPDATE
+                SET day = EXCLUDED.day,
+                    month = EXCLUDED.month,
+                    created_by = EXCLUDED.created_by
+            """,
+            guild_id, user_id, day, month, created_by,
+        )
+
+    async def get_birthday(self, guild_id: int, user_id: int) -> dict[str, Any] | None:
+        row = await self.pool.fetchrow(
+            "SELECT * FROM birthdays WHERE guild_id = $1 AND user_id = $2",
+            guild_id, user_id,
+        )
+        return dict(row) if row else None
+
+    async def remove_birthday(self, guild_id: int, user_id: int) -> bool:
+        result = await self.pool.execute(
+            "DELETE FROM birthdays WHERE guild_id = $1 AND user_id = $2",
+            guild_id, user_id,
+        )
+        return result.endswith("1")
+
+    async def list_birthdays_for_guild(self, guild_id: int) -> list[dict[str, Any]]:
+        rows = await self.pool.fetch(
+            """
+            SELECT * FROM birthdays
+            WHERE guild_id = $1
+            ORDER BY month, day
+            """,
+            guild_id,
+        )
+        return [dict(r) for r in rows]
+
+    async def get_birthdays_on(self, guild_id: int, month: int, day: int) -> list[dict[str, Any]]:
+        rows = await self.pool.fetch(
+            """
+            SELECT * FROM birthdays
+            WHERE guild_id = $1 AND month = $2 AND day = $3
+            """,
+            guild_id, month, day,
+        )
+        return [dict(r) for r in rows]
+
+    async def get_birthdays_in_month(self, guild_id: int, month: int) -> list[dict[str, Any]]:
+        rows = await self.pool.fetch(
+            """
+            SELECT * FROM birthdays
+            WHERE guild_id = $1 AND month = $2
+            ORDER BY day
+            """,
+            guild_id, month,
+        )
+        return [dict(r) for r in rows]
+
+    # ---------- Aniversário: runs ----------
+    async def get_birthday_run(self, guild_id: int) -> dict[str, Any] | None:
+        row = await self.pool.fetchrow(
+            "SELECT * FROM birthday_runs WHERE guild_id = $1",
+            guild_id,
+        )
+        return dict(row) if row else None
+
+    async def set_last_congrats_date(self, guild_id: int, d: date) -> None:
+        await self.pool.execute(
+            """
+            INSERT INTO birthday_runs (guild_id, last_congrats_date)
+            VALUES ($1, $2)
+            ON CONFLICT (guild_id) DO UPDATE
+                SET last_congrats_date = EXCLUDED.last_congrats_date
+            """,
+            guild_id, d,
+        )
+
+    async def set_last_role_cleanup_date(self, guild_id: int, d: date) -> None:
+        await self.pool.execute(
+            """
+            INSERT INTO birthday_runs (guild_id, last_role_cleanup_date)
+            VALUES ($1, $2)
+            ON CONFLICT (guild_id) DO UPDATE
+                SET last_role_cleanup_date = EXCLUDED.last_role_cleanup_date
+            """,
+            guild_id, d,
+        )
+
+    async def list_guilds_with_birthday_config(self) -> list[dict[str, Any]]:
+        rows = await self.pool.fetch(
+            """
+            SELECT guild_id, birthday_channel_id, birthday_role_id
+            FROM guild_config
+            WHERE birthday_channel_id IS NOT NULL
+            """
+        )
+        return [dict(r) for r in rows]
+
     # ---------- tickets ----------
     async def get_open_ticket(self, guild_id: int, user_id: int) -> dict[str, Any] | None:
         row = await self.pool.fetchrow(
@@ -289,7 +472,6 @@ class Database:
         step: str,
         data: dict[str, Any],
     ) -> None:
-        # Como o codec JSONB tá configurado no pool, dá pra passar o dict direto.
         await self.pool.execute(
             """
             UPDATE tickets
