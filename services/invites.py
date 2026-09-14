@@ -38,7 +38,14 @@ async def check_invite(
     bot: discord.Client,
     link: str,
 ) -> tuple[bool, str, dict[str, str | None] | None]:
-    """Valida um convite do Discord."""
+    """Valida um convite do Discord.
+
+    Regras:
+      - max_age == 0   → permanente ✅
+      - max_age is None → permanente ✅ (Discord retorna None pra convites
+                            criados com "Expira em: Nunca" em alguns casos)
+      - max_age > 0    → temporário ❌
+    """
     code = extract_invite_code(link)
     if code is None:
         return False, "O link não parece ser um convite do Discord válido.", None
@@ -62,7 +69,13 @@ async def check_invite(
     if invite.guild is None:
         return False, "Esse convite não aponta pra um servidor.", None
 
-    if invite.max_age is None or invite.max_age > 0:
+    logger.info(
+        "Convite %s: max_age=%r expires_at=%r",
+        code, invite.max_age, invite.expires_at,
+    )
+
+    # Só rejeita se for EXPLICITAMENTE temporário (max_age > 0).
+    if invite.max_age is not None and invite.max_age > 0:
         return (
             False,
             "Esse convite é **temporário**. Gere um convite **permanente** "
@@ -70,6 +83,7 @@ async def check_invite(
             None,
         )
 
+    # Checa expiração explícita (caso expires_at seja informado e já passou)
     from datetime import datetime, timezone
     if invite.expires_at is not None and invite.expires_at <= datetime.now(timezone.utc):
         return False, "Esse convite já expirou.", None
@@ -80,4 +94,3 @@ async def check_invite(
         "icon_url": icon_url,
     }
     return True, "Convite válido e permanente.", info
-
