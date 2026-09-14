@@ -6,7 +6,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from wizard.manager import WizardManager, ticket_channel
+from wizard.manager import WizardManager
 from wizard.steps import Step
 
 logger = logging.getLogger(__name__)
@@ -47,7 +47,6 @@ class Parceria(commands.Cog):
                     ephemeral=True,
                 )
             else:
-                # Canal sumiu — fecha o ticket órfão
                 await db.close_ticket(existing["id"], status="closed")
                 await interaction.followup.send(
                     "⚠️ Encontrei um ticket antigo quebrado e fechei. "
@@ -92,7 +91,6 @@ class Parceria(commands.Cog):
             ),
         }
 
-        # Adiciona cargo da staff se configurado
         staff_role_id = await db.get_staff_role(gid)
         if staff_role_id:
             role = interaction.guild.get_role(staff_role_id)
@@ -125,7 +123,6 @@ class Parceria(commands.Cog):
             )
             return
 
-        # Cria ticket no banco
         ticket_id = await db.create_ticket(
             guild_id=gid,
             channel_id=channel.id,
@@ -140,14 +137,12 @@ class Parceria(commands.Cog):
             )
             return
 
-        # Avisa o usuário onde foi
         await interaction.followup.send(
             f"✅ Criei seu canal privado: {channel.mention}\n"
             "Responde as perguntas por lá.",
             ephemeral=True,
         )
 
-        # Manda a primeira pergunta
         await channel.send(
             f"👋 Olá, {interaction.user.mention}!\n"
             "Vou te fazer algumas perguntas pra montar sua proposta de parceria.\n"
@@ -186,6 +181,63 @@ class Parceria(commands.Cog):
                 logger.exception("Falha ao deletar canal cancelado")
 
         await interaction.followup.send("✅ Parceria cancelada.", ephemeral=True)
+
+    # ------------------------------------------------------------------
+    # /fechar  (staff)
+    # ------------------------------------------------------------------
+    @app_commands.command(
+        name="fechar",
+        description="[Staff] Fecha o ticket de parceria do canal atual.",
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    async def fechar(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        if not interaction.guild or not isinstance(
+            interaction.channel, discord.TextChannel
+        ):
+            return
+
+        db = self.bot.database  # type: ignore[attr-defined]
+        ticket = await db.get_ticket_by_channel(interaction.channel_id)
+        if not ticket:
+            await interaction.followup.send(
+                "Esse canal não é um ticket de parceria.", ephemeral=True
+            )
+            return
+        if ticket["status"] != "open":
+            await interaction.followup.send(
+                "Esse ticket já foi fechado.", ephemeral=True
+            )
+            return
+
+        await db.close_ticket(ticket["id"], status="closed")
+
+        # Tenta mover pra categoria de fechados
+        closed_category_id = await db.get_closed_category(interaction.guild.id)
+        new_category = None
+        if closed_category_id:
+            cat = interaction.guild.get_channel(closed_category_id)
+            if isinstance(cat, discord.CategoryChannel):
+                new_category = cat
+
+        new_name = f"fechado-{interaction.channel.name}"[:100]
+
+        try:
+            await interaction.channel.edit(
+                name=new_name,
+                category=new_category,
+                reason=f"Fechado por {interaction.user}",
+            )
+        except discord.HTTPException:
+            logger.exception("Falha ao mover/renomear canal")
+            await interaction.followup.send(
+                "Não consegui mover o canal. Verifique minhas permissões.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send("✅ Ticket fechado.", ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:
