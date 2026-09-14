@@ -18,11 +18,27 @@ class Database:
         self._pool: asyncpg.Pool | None = None
 
     async def connect(self) -> None:
+        async def _init_connection(conn: asyncpg.Connection) -> None:
+            # Faz asyncpg converter JSONB <-> dict Python automaticamente.
+            await conn.set_type_codec(
+                "jsonb",
+                encoder=json.dumps,
+                decoder=json.loads,
+                schema="pg_catalog",
+            )
+            await conn.set_type_codec(
+                "json",
+                encoder=json.dumps,
+                decoder=json.loads,
+                schema="pg_catalog",
+            )
+
         self._pool = await asyncpg.create_pool(
             DATABASE_URL,
             min_size=1,
             max_size=5,
             command_timeout=30,
+            init=_init_connection,
         )
         logger.info("Pool de conexões criado.")
         await self._run_migrations()
@@ -273,13 +289,14 @@ class Database:
         step: str,
         data: dict[str, Any],
     ) -> None:
+        # Como o codec JSONB tá configurado no pool, dá pra passar o dict direto.
         await self.pool.execute(
             """
             UPDATE tickets
-            SET step = $1, data = $2::jsonb, updated_at = NOW()
+            SET step = $1, data = $2, updated_at = NOW()
             WHERE id = $3
             """,
-            step, json.dumps(data), ticket_id,
+            step, data, ticket_id,
         )
 
     async def close_ticket(self, ticket_id: int, status: str) -> None:
