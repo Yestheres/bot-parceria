@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Any
@@ -28,6 +29,23 @@ def strip_leading_mention(content: str) -> str:
     return _MENTION_RE.sub("", content or "").strip()
 
 
+def _coerce_data(raw: Any) -> dict[str, Any]:
+    """Garante que o campo `data` venha como dict, mesmo se o driver
+    devolver string JSON (o que acontece com tickets antigos gravados
+    antes do codec JSONB ser configurado no pool)."""
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return dict(parsed) if isinstance(parsed, dict) else {}
+        except (ValueError, TypeError):
+            return {}
+    return {}
+
+
 class WizardManager:
     def __init__(self, bot: discord.Client, db: Database) -> None:
         self.bot = bot
@@ -48,11 +66,11 @@ class WizardManager:
     ) -> None:
         step = Step(ticket["step"])
         content = strip_leading_mention(message.content)
-        data: dict[str, Any] = dict(ticket["data"] or {})
+        data: dict[str, Any] = _coerce_data(ticket.get("data"))
 
         logger.info(
-            "Wizard: step=%s | raw=%r | clean=%r",
-            step.value, message.content[:60], content[:60],
+            "Wizard: step=%s | raw=%r | clean=%r | data_keys=%s",
+            step.value, message.content[:60], content[:60], list(data.keys()),
         )
 
         if step == Step.NOME:
@@ -115,7 +133,7 @@ class WizardManager:
                         base_url=ai_config["base_url"],
                         model=ai_config["model"],
                         server_name=data.get("name", ""),
-                        description=data["description"],
+                        description=data.get("description", ""),
                     )
                 except Exception:
                     logger.exception("Erro na IA")
